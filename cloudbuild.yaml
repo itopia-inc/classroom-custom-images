@@ -1,0 +1,171 @@
+substitutions:
+    _NAME: "k12"
+    _PACKER_IMAGE: "./images/classroom_2022_noapps"
+    _ENVIRONMENT: "dev"
+    _ZONE: "us-central1-a"
+    _ACTION: "build"
+    _BUILD_IMAGES: "false"
+    _PROMOTE_IMAGE: "false"
+    _CUSTOM_SOURCE_IMAGE: ""
+    _FIRESTORE_UPDATE_IMAGES: "false"
+    _SERVICES_PROJECT_ID: ""
+
+options:
+  machineType: "E2_HIGHCPU_8"
+  
+timeout: 18000s
+
+tags: ['itopia-labs-images-${_ENVIRONMENT}']
+
+steps:
+  ###
+  # Check if image already exists
+  ###
+  - name: "gcr.io/${PROJECT_ID}/packer"
+    id: "check-image-by-fingerprint"
+    args:
+      - -c
+      - |
+         echo "Checking if auto promoting is enabled"
+         if [[ "${_PROMOTE_IMAGE}" == "true" ]]; then
+
+            git rev-parse HEAD > /workspace/CommitID
+            echo "Commit ID: " $(cat /workspace/CommitID)    
+
+            BUCKET_SLUG_NAME=$(grep -A2 'family_name' ${_PACKER_IMAGE}/variables.pkr.hcl | grep -v "family_name" | sed -n 2p | cut -d "=" -f 2 | tr -d '"')
+            echo "Bucket Slug Name: " $$BUCKET_SLUG_NAME
+
+            export HCP_CLIENT_ID=$(gcloud -q secrets versions access latest --secret HCP_CLIENT_ID)
+            export HCP_CLIENT_SECRET=$(gcloud -q secrets versions access latest --secret HCP_CLIENT_SECRET)
+            export HCP_ORGANIZATION_ID=$(gcloud -q secrets versions access latest --secret HCP_ORGANIZATION_ID)
+            export HCP_PROJECT_ID=$(gcloud -q secrets versions access latest --secret HCP_PROJECT_ID)
+
+            echo "Checking if iteration already exist"
+            jsonResponse=$(ihcptool iteration existAsJson $${BUCKET_SLUG_NAME} $(cat /workspace/CommitID))
+
+            iterationExist=$(echo $${jsonResponse} | jq ".Exist" | sed 's/"//g')
+            iterationStatus=$(echo $${jsonResponse} | jq ".Status" | sed 's/"//g')          
+            
+            if [[ $${iterationExist} ==  "true" && $${iterationStatus} == "Ready" ]] ; then
+
+                echo $${jsonResponse} | jq ".ID" | sed 's/"//g' > /workspace/iteration_id
+
+                echo "true" > /workspace/iteration_exist
+                echo "Iteration already exists." cat /workspace/iteration_id
+                
+                echo "{
+                    \"builds\": [
+                    {
+                        \"custom_data\": {
+                            \"bucket_name\": \"$$BUCKET_SLUG_NAME\",
+                            \"iteration\": \"$(cat /workspace/iteration_id)\"
+                        }
+                    }
+                    ]
+                }" > /workspace/manifest.json
+            else
+                echo "false" > /workspace/iteration_exist
+                echo "Iteration does not exists."
+            fi
+         else
+            echo "Skipping check because auto promoting is disabled"
+         fi
+    waitFor: ["build-pipeline-images"]
+
+  ###
+  # Build packer
+  ###
+  - name: "gcr.io/${PROJECT_ID}/packer"
+    id: "packer-build"
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        
+        if [[ "${_PROMOTE_IMAGE}" == "true" && $(cat /workspace/iteration_exist) == "true" ]] ; then
+            echo "Image already exist. Skipping build."
+            exit 0
+        fi
+
+        chmod +x /workspace/deploy.sh
+        chmod -R +x /workspace/image-creation/scripts/*.sh
+        
+        #find sh files and convert to Unix format
+        dos2unix /workspace/deploy.sh
+        files=$(find ./image-creation/scripts/ -type f -name "*.sh")
+        for file in $files; do
+          dos2unix $file
+        done
+
+        /workspace/deploy.sh
+    env:
+      - PKR_VAR_project_id=${PROJECT_ID}
+      - PKR_VAR_name=${_NAME}
+      - PKR_VAR_zone=${_ZONE}
+      - PKR_VAR_environment=${_ENVIRONMENT}
+      - PKR_VAR_promote_image=${_PROMOTE_IMAGE}
+      - ACTION=${_ACTION}
+      - PACKER_IMAGE=${_PACKER_IMAGE}
+      - PKR_VAR_custom_source_image=${_CUSTOM_SOURCE_IMAGE}
+    waitFor: ["check-image-by-fingerprint"]
+  
+  ###
+  # Promoting Image
+  ###
+  - name: "gcr.io/${PROJECT_ID}/packer"
+    id: "promote-image"
+    args:
+      - -c
+      - |
+         echo "Checking if auto promoting is enabled"
+         if [[ "${_PROMOTE_IMAGE}" == "true" ]]; then
+
+            echo "Getting bucket and iteration id from image manifest"
+            BUCKET_SLUG_NAME=$(cat /workspace/manifest.json | jq .builds[0].custom_data.bucket_name | sed 's/"//g')
+            echo $$BUCKET_SLUG_NAME > /workspace/bucket-slug-name.config
+            ITERATION_ID=$(cat /workspace/manifest.json | jq .builds[0].custom_data.iteration | sed 's/"//g')
+
+            export HCP_CLIENT_ID=$(gcloud -q secrets versions access latest --secret HCP_CLIENT_ID)
+            export HCP_CLIENT_SECRET=$(gcloud -q secrets versions access latest --secret HCP_CLIENT_SECRET)
+
+            export HCP_ORGANIZATION_ID=$(gcloud -q secrets versions access latest --secret HCP_ORGANIZATION_ID)
+            export HCP_PROJECT_ID=$(gcloud -q secrets versions access latest --secret HCP_PROJECT_ID)            
+
+            echo "Promoting iteration $$ITERATION_ID of $$BUCKET_SLUG_NAME to channel ${_ENVIRONMENT}"
+            ihcptool channel iteration_update $$BUCKET_SLUG_NAME $$ITERATION_ID ${_ENVIRONMENT}
+            ITERATION_NAME=$(ihcptool channel iteration_latest $$BUCKET_SLUG_NAME ${_ENVIRONMENT})
+            echo $$ITERATION_NAME > /workspace/iteration-name.config
+            echo "Promotion complete"
+         else 
+            echo "Image won't be promoted because _PROMOTE_IMAGE is set to false"
+         fi
+
+    waitFor: ["packer-build"]
+
+  ###
+  # Updating Image in firestore
+  ###
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: "update-image-firestore"
+    dir: "image-creation/infra/images-data"
+    entrypoint: bash
+    args:
+      - -c
+      - |
+         echo "Checking if _FIRESTORE_UPDATE_IMAGES and  _PROMOTE_IMAGE are enabled"
+         if [[ "${_FIRESTORE_UPDATE_IMAGES}" == "true" && "${_PROMOTE_IMAGE}" == "true" ]]; then
+
+            if [[ -f "/workspace/manifest.json" ]]; then  
+                BUCKET_SLUG_NAME=$(cat /workspace/bucket-slug-name.config)
+                ITERATION_NAME=$(cat /workspace/iteration-name.config)
+                gcloud builds submit --substitutions=_SERVICES_PROJECT_ID=${_SERVICES_PROJECT_ID},_ENVIRONMENT=${_ENVIRONMENT},_IMAGE_ITERATION_NAME=$$ITERATION_NAME,_BUCKET_SLUG_NAME=$$BUCKET_SLUG_NAME .  
+                echo "Update firestore complete"
+            else
+              echo "File /workspace/manifest.json don't exist"
+            fi  
+
+         else 
+            echo "Image won't be update in firestore because _FIRESTORE_UPDATE_IMAGES or _PROMOTE_IMAGE is set to false"
+         fi
+
+    waitFor: ["promote-image"]
